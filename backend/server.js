@@ -37,7 +37,18 @@ app.post('/api/barkod-ekle', async (req, res) => {
   SELECT STEXT FROM IASPRDOPR WHERE CONFIRMATION = ${CONFIRMATION}`;
   const STEXT = stResponse.recordset[0]?.STEXT?.trim() || '-';
   const SICILNO = req.body.SICILNO || null;
-   
+   // SICILNO'ya karşılık gelen ad-soyadı çekiyoruz
+let FULLNAME = '-';
+try {
+  
+  const nameResult = await sql.query`
+    SELECT DISPLAY FROM IASHCMPER WHERE PERSID = ${SICILNO} AND EMPLTYPE = 0
+  `;
+  FULLNAME = nameResult.recordset[0]?.DISPLAY || '-';
+} catch (e) {
+  console.error("❌ FULLNAME alınamadı:", e.message);
+}
+
  
    if (!aracID || !kutuID) {
     return res.status(400).json({ success: false, message: "AracID veya KutuID eksik." });
@@ -55,23 +66,40 @@ app.post('/api/barkod-ekle', async (req, res) => {
   .input('QUANTITY', sql.Int, QUANTITY)
   .input('SICILNO', sql.VarChar, SICILNO)  
   .input('STEXT', sql.VarChar, STEXT)
+  .input('FULLNAME', sql.VarChar, FULLNAME)
 
 
 
   .query(`
-    IF @ARACID = 'ÜRETİM SAHASI'
-      DELETE FROM KutuTakipLog WHERE KUTUID = @KUTUID;
-    ELSE IF EXISTS (SELECT 1 FROM KutuTakipLog WHERE KUTUID = @KUTUID AND ARACID = @ARACID)
-      SELECT 'ZATEN_EKLENDI' AS durum;
-    ELSE IF EXISTS (SELECT 1 FROM KutuTakipLog WHERE KUTUID = @KUTUID)
-      UPDATE KutuTakipLog 
-      SET ARACID = @ARACID, CREATEDAT = GETDATE(), MATERIAL = @MATERIAL, PRDORDER = @PRDORDER, CONFIRMATION  = @CONFIRMATION,  QUANTITY = @QUANTITY, SICILNO = @SICILNO
-      WHERE KUTUID = @KUTUID;
-    ELSE IF EXISTS (SELECT 1 FROM KutuTakipLog WHERE ARACID = @ARACID)
-      SELECT 'RAF_DOLU' AS durum;
-    ELSE
-      INSERT INTO KutuTakipLog (ARACID, KUTUID, CREATEDAT, MATERIAL, PRDORDER, CONFIRMATION, QUANTITY, STEXT, SICILNO) 
-      VALUES (@ARACID, @KUTUID, GETDATE(), @MATERIAL, @PRDORDER, @CONFIRMATION, @QUANTITY, @STEXT, @SICILNO);
+         IF @ARACID = 'ÜRETİM SAHASI'
+  UPDATE KutuTakipLog
+  SET ISDELETE = 1, CREATEDAT = GETDATE(), FULLNAME = @FULLNAME, SICILNO = @SICILNO
+  WHERE KUTUID = @KUTUID;
+
+ELSE IF EXISTS (SELECT 1 FROM KutuTakipLog WHERE KUTUID = @KUTUID AND ARACID = @ARACID)
+  SELECT 'ZATEN_EKLENDI' AS durum;
+
+ELSE IF EXISTS (SELECT 1 FROM KutuTakipLog WHERE KUTUID = @KUTUID)
+  UPDATE KutuTakipLog
+  SET ARACID = @ARACID, CREATEDAT = GETDATE(), MATERIAL = @MATERIAL, PRDORDER = @PRDORDER, 
+      CONFIRMATION = @CONFIRMATION, QUANTITY = @QUANTITY, SICILNO = @SICILNO, FULLNAME = @FULLNAME
+  WHERE KUTUID = @KUTUID;
+
+ELSE IF EXISTS (
+  SELECT 1 FROM KutuTakipLog
+  WHERE ARACID = @ARACID 
+    AND KUTUID IS NOT NULL 
+    AND ISDELETE = 0
+    AND LTRIM(RTRIM(KUTUID)) <> ''
+)
+  SELECT 'RAF_DOLU' AS durum;
+
+ELSE
+  INSERT INTO KutuTakipLog
+    (ARACID, KUTUID, CREATEDAT, MATERIAL, PRDORDER, CONFIRMATION, QUANTITY, STEXT, SICILNO, FULLNAME, ISDELETE) 
+  VALUES 
+    (@ARACID, @KUTUID, GETDATE(), @MATERIAL, @PRDORDER, @CONFIRMATION, @QUANTITY, @STEXT, @SICILNO, @FULLNAME,0);
+
 `)
 
     if (result?.recordset?.[0]?.durum === 'ZATEN_EKLENDI') {
@@ -96,7 +124,10 @@ app.post('/api/barkod-ekle', async (req, res) => {
 app.get('/api/kutu-durumlari', async (req, res) => {
   try {
     const pool = await sql.connect(config);
-    const result = await pool.request().query(`SELECT ARACID, KUTUID, CREATEDAT, MATERIAL, PRDORDER, CONFIRMATION, QUANTITY FROM KutuTakipLog`);
+    const result = await pool.request().query(`
+  SELECT ARACID, KUTUID, CREATEDAT, MATERIAL, PRDORDER, CONFIRMATION, QUANTITY, FULLNAME 
+  FROM KutuTakipLog WHERE ISDELETE = 0`);
+
     res.json(result.recordset);
       
   } catch (err) {
@@ -143,7 +174,46 @@ app.get('/api/stext/:confirmation', async (req, res) => {
   }
 });
 
+app.get('/api/kutu-gecmis/:kutuID', async (req, res) => {
+  const kutuID = req.params.kutuID;
 
+  try {
+    const pool = await sql.connect(config);
+    const result = await pool.request()
+      .input('KUTUID', sql.VarChar, kutuID)
+      .query(`
+      SELECT ARACID, KUTUID, CREATEDAT, SICILNO, FULLNAME, ISDELETE
+         FROM KutuTakipLog
+         WHERE KUTUID = @KUTUID
+         ORDER BY CREATEDAT DESC`);
+
+    res.json(result.recordset);
+  } catch (err) {
+    console.error("❌ Kutu geçmişi hatası:", err.message);
+    res.status(500).json({ success: false, error: 'Geçmiş alınamadı.' });
+  }
+});
+app.get('/api/silinmis-kutu/:kutuID', async (req, res) => {
+  const kutuID = req.params.kutuID;
+  try {
+    const pool = await sql.connect(config);
+    const result = await pool.request()
+      .input('KUTUID', sql.VarChar, kutuID)
+      .query(`
+        SELECT ARACID, KUTUID, CREATEDAT, MATERIAL, PRDORDER, CONFIRMATION, QUANTITY, FULLNAME 
+        FROM KutuTakipLog
+        WHERE ISDELETE = 1 AND KUTUID = @KUTUID
+      `);
+    res.json(result.recordset);
+  } catch (err) {
+    console.error("❌ Silinmiş kutu sorgulama hatası:", err.message);
+    res.status(500).json({ error: 'Silinmiş kutu alınamadı' });
+  }
+});
+
+
+//app.listen(5000, '0.0.0.0', () => {
+  //console.log("Sunucu çalışıyor...");
 app.listen(5000, () => {
   console.log('🟢 Sunucu 5000 portunda çalışıyor...');
 });
